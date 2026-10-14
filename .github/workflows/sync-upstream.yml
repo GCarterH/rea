@@ -16,4 +16,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh repo sync "$GITHUB_REPOSITORY" --source morluto/rea --branch main
+          gh repo sync "$GITHUB_REPOSITORY" --source morluto/rea --branch main --force
