@@ -1,13 +1,20 @@
 import type { JavaScriptSourceAnalysisPort } from "../domain/javascript/javascriptSourceAnalysis.js";
 import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import type { OwnedDirectoryHandle } from "../filesystem/OwnedDirectoryHandle.js";
+import type { OwnedStagedOutput } from "../filesystem/OwnedStagedOutput.js";
 
 import type { ArtifactReader } from "./ArtifactReader.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import type { SafeOutputTree } from "./SafeOutputTree.js";
+import type { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 
-/** One artifact resource and its format-specific cleanup owner. */
+/** One artifact resource and the capability that owns its cleanup. */
 export type ArtifactResourceOwner =
+  | {
+      readonly kind: "lease";
+      readonly resource: string;
+      readonly lease: { release(): Promise<void> };
+    }
   | {
       readonly kind: "javascript-source-analysis";
       readonly resource: string;
@@ -32,11 +39,32 @@ export type ArtifactResourceOwner =
       readonly kind: "output-tree";
       readonly resource: string;
       readonly tree: SafeOutputTree;
+    }
+  | {
+      readonly kind: "staged-output";
+      readonly resource: string;
+      readonly output: OwnedStagedOutput;
+    }
+  | {
+      readonly kind: "private-runtime-root";
+      readonly resource: string;
+      readonly root: Pick<PrivateRuntimeRoot, "path" | "close">;
     };
 
 export type ArtifactCleanupAttempt =
   | { readonly kind: "released" }
   | { readonly kind: "failed"; readonly cause: unknown };
+
+/** Retry failure carrying the exact retained owners that did not release. */
+export class ArtifactResourceRetryFailure extends ArtifactReaderFailure {
+  constructor(
+    readonly failedOwners: readonly ArtifactResourceOwner[],
+    message: string,
+    options: ConstructorParameters<typeof ArtifactReaderFailure>[2],
+  ) {
+    super("unavailable", message, options);
+  }
+}
 
 /** Caller-owned scope that retains failed artifact cleanup for a later close. */
 export class ArtifactResourceScope {
@@ -44,6 +72,10 @@ export class ArtifactResourceScope {
   readonly #active = new Set<Promise<unknown>>();
   #draining: Promise<void> | undefined;
   #closed = false;
+
+  get hasPending(): boolean {
+    return this.#pending.size > 0;
+  }
 
   /** Admit a resource operation while the scope remains open. */
   async run<T>(operation: () => Promise<T>): Promise<T> {
@@ -60,7 +92,7 @@ export class ArtifactResourceScope {
           "Artifact resource scope is closed",
         );
       if (this.#pending.size > 0) {
-        await this.#retryCleanup();
+        await this.retryCleanup();
         continue;
       }
       const running = Promise.resolve().then(operation);
@@ -85,8 +117,13 @@ export class ArtifactResourceScope {
     }
   }
 
+  /** Adopt an owner after another boundary's cleanup attempt failed. */
+  retain(owner: ArtifactResourceOwner): void {
+    this.#pending.add(owner);
+  }
+
   /** Retry retained owners without closing resource admission. */
-  #retryCleanup(): Promise<void> {
+  retryCleanup(): Promise<void> {
     if (this.#draining !== undefined) return this.#draining;
     this.#draining = this.#drainAndRetry().finally(() => {
       this.#draining = undefined;
@@ -97,7 +134,7 @@ export class ArtifactResourceScope {
   /** Stop admission, wait for active operations, and retry every retained owner. */
   close(): Promise<void> {
     this.#closed = true;
-    return this.#retryCleanup();
+    return this.retryCleanup();
   }
 
   async #drainAndRetry(): Promise<void> {
@@ -121,8 +158,8 @@ export class ArtifactResourceScope {
     const resources = [
       ...new Set(observations.flatMap(({ resources }) => resources)),
     ];
-    throw new ArtifactReaderFailure(
-      "unavailable",
+    throw new ArtifactResourceRetryFailure(
+      failures.map(({ owner }) => owner),
       `Artifact cleanup remains incomplete: ${resources.join(", ")}`,
       {
         cause: new AggregateError(
@@ -140,6 +177,9 @@ export class ArtifactResourceScope {
 
 const cleanup = async (owner: ArtifactResourceOwner): Promise<void> => {
   switch (owner.kind) {
+    case "lease":
+      await owner.lease.release();
+      return;
     case "javascript-source-analysis":
       await owner.analysis.close();
       return;
@@ -152,5 +192,11 @@ const cleanup = async (owner: ArtifactResourceOwner): Promise<void> => {
       return;
     case "output-tree":
       await owner.tree.rollback();
+      return;
+    case "staged-output":
+      await owner.output.close();
+      return;
+    case "private-runtime-root":
+      await owner.root.close();
   }
 };

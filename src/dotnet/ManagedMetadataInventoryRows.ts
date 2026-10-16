@@ -1,5 +1,6 @@
 import { managedDecodeBudget } from "./ManagedDecodeBudget.js";
 import { memberDeclaringTypeRowLookup } from "./ManagedMemberOwnership.js";
+import type { TypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 
 import type {
   ManagedArtifactInspection,
@@ -26,6 +27,13 @@ type AssemblyIdentity = NonNullable<ManagedArtifactInspection["assembly"]>;
 type AssemblyReference = ManagedArtifactInspection["references"][number];
 type ManagedResource = ManagedArtifactInspection["resources"][number];
 type CustomAttribute = ManagedArtifactInspection["attributes"][number];
+
+const HAS_CUSTOM_ATTRIBUTE_TABLES = [
+  6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42, 44,
+  43,
+] as const;
+
+const CUSTOM_ATTRIBUTE_TYPE_TABLES = [undefined, undefined, 6, 10] as const;
 
 const publicKeyIdentity = (
   bytes: Buffer,
@@ -241,8 +249,14 @@ const declaringTypeForMethod = (
   layout: ManagedMetadataLayout,
   methodRow: number,
   heapExtent: number,
+  memberLists: TypeMemberListFacts,
 ): string | null => {
-  const owner = memberDeclaringTypeRowLookup(bytes, layout, 6)(methodRow);
+  const owner = memberDeclaringTypeRowLookup(
+    bytes,
+    layout,
+    6,
+    memberLists,
+  )(methodRow);
   if (owner === 0) return null;
   return readTypeName({ bytes, layout, table: 2, row: owner, heapExtent });
 };
@@ -252,11 +266,13 @@ const attributeTypeName = (
   layout: ManagedMetadataLayout,
   rawType: number,
   heapExtent: number,
+  memberLists: TypeMemberListFacts,
 ): string | null => {
   const tag = rawType & 7;
   const row = Math.floor(rawType / 8);
   if (row === 0) return null;
-  if (tag === 2) return declaringTypeForMethod(bytes, layout, row, heapExtent);
+  if (tag === 2)
+    return declaringTypeForMethod(bytes, layout, row, heapExtent, memberLists);
   if (tag !== 3) return null;
   const memberRefs = layout.table(10);
   if (memberRefs === undefined || row > memberRefs.rowCount) return null;
@@ -281,7 +297,13 @@ const attributeTypeName = (
       heapExtent,
     });
   if (parentTag === 3)
-    return declaringTypeForMethod(bytes, layout, parentRow, heapExtent);
+    return declaringTypeForMethod(
+      bytes,
+      layout,
+      parentRow,
+      heapExtent,
+      memberLists,
+    );
   return null;
 };
 
@@ -342,6 +364,7 @@ export const readCustomAttribute = (
   row: number,
   heapExtent: number,
   issues: ManagedParseIssue[],
+  memberLists: TypeMemberListFacts,
 ): CustomAttribute => {
   const cursor = metadataRowCursor(bytes, layout, 12, row);
   const parentRaw = cursor.readIndex(
@@ -360,56 +383,57 @@ export const readCustomAttribute = (
   const parent = metadataCodedToken(
     parentRaw,
     5,
-    [
-      6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42,
-      44, 43,
-    ],
+    HAS_CUSTOM_ATTRIBUTE_TABLES,
     layout.rowCounts,
   );
-  const parentReason = metadataCodedTokenInvalidReason(
-    parentRaw,
-    5,
-    [
-      6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42,
-      44, 43,
-    ],
-    layout.rowCounts,
-  );
-  if (parent === null)
+  if (parent === null) {
+    const parentReason = metadataCodedTokenInvalidReason(
+      parentRaw,
+      5,
+      HAS_CUSTOM_ATTRIBUTE_TABLES,
+      layout.rowCounts,
+    );
     throw managedFailure(
       "invalid-row",
       `metadata.CustomAttribute:${metadataToken(12, row)}`,
       `CustomAttribute parent coded index 0x${parentRaw.toString(16)} is invalid${parentReason === null ? " because the required parent is null" : `: ${parentReason}`}`,
       cursor.start,
     );
-  const typeReason = metadataCodedTokenInvalidReason(
+  }
+  const constructor = metadataCodedToken(
     typeRaw,
     3,
-    [undefined, undefined, 6, 10],
+    CUSTOM_ATTRIBUTE_TYPE_TABLES,
     layout.rowCounts,
   );
-  if (typeReason !== null || typeRaw === 0)
-    throw managedFailure(
-      "invalid-row",
-      `metadata.CustomAttribute:${metadataToken(12, row)}`,
-      typeReason === null
-        ? "CustomAttribute constructor coded index 0x0 is null, but Type must reference a MethodDef or MemberRef row"
-        : `CustomAttribute constructor coded index 0x${typeRaw.toString(16)} is invalid: ${typeReason}`,
-      typeOffset,
-    );
-  const typeName =
-    readManagedValue(
-      () => attributeTypeName(bytes, layout, typeRaw, heapExtent),
-      issues,
-    ) ?? null;
-  return {
-    parent_token: parent,
-    constructor_token: metadataCodedToken(
+  if (constructor === null) {
+    const typeReason = metadataCodedTokenInvalidReason(
       typeRaw,
       3,
-      [undefined, undefined, 6, 10],
+      CUSTOM_ATTRIBUTE_TYPE_TABLES,
       layout.rowCounts,
-    ),
+    );
+    issues.push({
+      code: "invalid-row",
+      scope: `metadata.CustomAttribute:${metadataToken(12, row)}`,
+      offset: typeOffset,
+      detail:
+        typeReason === null
+          ? "CustomAttribute constructor coded index 0x0 is null, but Type must reference a MethodDef or MemberRef row"
+          : `CustomAttribute constructor coded index 0x${typeRaw.toString(16)} is invalid: ${typeReason}`,
+    });
+  }
+  let typeName: string | null = null;
+  if (constructor !== null)
+    typeName =
+      readManagedValue(
+        () =>
+          attributeTypeName(bytes, layout, typeRaw, heapExtent, memberLists),
+        issues,
+      ) ?? null;
+  return {
+    parent_token: parent,
+    constructor_token: constructor,
     type_name: typeName,
     value_length: value.length,
     value_sha256: managedDecodeBudget(layout).digest(value, "sha256"),

@@ -17,6 +17,7 @@ import { DirectoryArtifactReader } from "../DirectoryArtifactReader.js";
 import { SafeOutputTree } from "../SafeOutputTree.js";
 import { SafeOutputTreeCreationFailure } from "../SafeOutputTreeCreationFailure.js";
 import { ZipArtifactReader } from "../ZipArtifactReader.js";
+import { isZipPackageFormat } from "../../domain/zipPackageFormat.js";
 import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
 import {
   artifactExtractionResultSchema,
@@ -31,7 +32,10 @@ import type {
   ArtifactResourceOwner,
   ArtifactResourceScope,
 } from "../ArtifactResourceScope.js";
-import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
+import {
+  isMachOFormat,
+  type BinaryTarget,
+} from "../../domain/binaryTargetTypes.js";
 import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySnapshot.js";
 import { scanArtifactInventoryInScope } from "../inventory/ArtifactInventory.js";
 import type { ArtifactIntegrityPolicyName } from "../../domain/artifactIntegrityPolicy.js";
@@ -210,9 +214,16 @@ const materializeSelection = async ({
   readonly selected: readonly SelectedOccurrence[];
   readonly signal: AbortSignal | undefined;
 }): Promise<ArtifactExtractionResult> => {
-  const byPath = new Map(
-    selected.map((item) => [item.occurrence.logical_path, item]),
-  );
+  const byPath = new Map<string, SelectedOccurrence>();
+  for (const item of selected) {
+    const path = item.occurrence.logical_path;
+    if (byPath.has(path))
+      throw new ArtifactReaderFailure(
+        "path",
+        `Artifact extraction path collision: ${JSON.stringify(path)}. Multiple selected occurrences share this normalized logical path; they cannot be materialized at the same destination path, even when the archive is valid. Inventory retains each occurrence.`,
+      );
+    byPath.set(path, item);
+  }
   const reader = await createReader(sourcePath, input);
   const readerOwner: ArtifactResourceOwner = {
     kind: "reader" as const,
@@ -245,7 +256,7 @@ const materializeSelection = async ({
       compareUnicodeCodePoints(left.relative_path, right.relative_path),
     );
     completed = createExtractionResult(input, inventory, selected, extracted);
-    await output.commit();
+    await output.commit(signal);
     return completed;
   } catch (cause: unknown) {
     const cleanupFailures = await releaseExtractionOwners(
@@ -397,13 +408,6 @@ interface ExtractionInventory {
   readonly integrityContradictions: readonly IntegrityContradiction[];
 }
 
-const ZIP_FORMATS = ["ipa", "apk", "msix", "appx", "zip"] as const;
-
-const isZipFormat = (
-  format: BinaryTarget["format"],
-): format is (typeof ZIP_FORMATS)[number] =>
-  (ZIP_FORMATS as readonly string[]).includes(format);
-
 /**
  * Refuse a format without an extraction reader before inventory work starts.
  * The target kind, not the host, is unsupported by extraction. The error keeps
@@ -418,8 +422,8 @@ const requireExtractableFormat = async (
   if (
     !directory &&
     format !== "asar" &&
-    format !== "mach-o" &&
-    !isZipFormat(format)
+    !isMachOFormat(format) &&
+    !isZipPackageFormat(format)
   )
     throw new AnalysisUnsupportedTargetError(
       "extract_artifact",
@@ -440,7 +444,7 @@ const createReader = async (
   if (await requireExtractableFormat(path, input))
     return new DirectoryArtifactReader(path);
   if (format === "asar") return new AsarArtifactReader(path);
-  if (isZipFormat(format)) return new ZipArtifactReader(path, format);
+  if (isZipPackageFormat(format)) return new ZipArtifactReader(path, format);
   return new MachOSliceArtifactReader(path, input.environment);
 };
 

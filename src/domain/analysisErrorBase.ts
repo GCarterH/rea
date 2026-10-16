@@ -1,3 +1,5 @@
+import type { JsonValue } from "./jsonValue.js";
+
 /** Stable tags exposed by safe analysis-error projections. */
 const ANALYSIS_ERROR_TAGS = [
   "AnalysisProtocolError",
@@ -51,6 +53,8 @@ export interface AnalysisCleanupObservation {
 
 /** Optional provider-neutral context that must survive typed error projection. */
 export interface AnalysisErrorOptions extends ErrorOptions {
+  /** Producer-owned, caller-safe facts retained through every typed projection. */
+  readonly diagnostics?: Readonly<Record<string, JsonValue>> | undefined;
   readonly capturedOutput?: AnalysisCapturedOutput | undefined;
   readonly cleanup?: AnalysisCleanupObservation | undefined;
   readonly partialObservation?: AnalysisPartialObservation | undefined;
@@ -58,12 +62,17 @@ export interface AnalysisErrorOptions extends ErrorOptions {
 
 /** Base class for expected analysis, provider, and session failures. */
 export abstract class AnalysisError extends Error {
+  readonly diagnostics: Readonly<Record<string, JsonValue>> | undefined;
   readonly capturedOutput: AnalysisCapturedOutput | undefined;
   readonly cleanup: AnalysisCleanupObservation | undefined;
-  readonly cleanupIncomplete: boolean;
+  cleanupIncomplete: boolean;
   readonly cleanupResources: readonly string[];
   constructor(message: string, options?: AnalysisErrorOptions) {
     super(message, options);
+    this.diagnostics =
+      options?.diagnostics === undefined
+        ? undefined
+        : structuredClone(options.diagnostics);
     this.capturedOutput =
       options?.capturedOutput === undefined
         ? undefined
@@ -79,6 +88,30 @@ export abstract class AnalysisError extends Error {
   readonly executionFailure: string | undefined = undefined;
   partialObservation: AnalysisPartialObservation | undefined;
   readonly cleanupReport: ProcessCaptureCleanupReport | undefined = undefined;
+
+  /** Retain a later lifecycle failure without replacing the original typed error. */
+  retainSecondaryFailure(
+    failure: AnalysisError,
+    diagnostics: Readonly<Record<string, JsonValue>>,
+  ): this {
+    // Secondary resources remain owned by their cleanup lifecycle; preserve
+    // the primary error's live cleanup status and original output.
+    Object.assign(this, {
+      diagnostics: structuredClone({ ...this.diagnostics, ...diagnostics }),
+      cause: new AggregateError(
+        this.cause === undefined ? [failure] : [this.cause, failure],
+        "Analysis failed and a later lifecycle operation also failed.",
+        { cause: this.cause },
+      ),
+    });
+    return this;
+  }
+
+  /** Clear live cleanup status only after its owning resource confirms retry success. */
+  resolveCleanup(): this {
+    this.cleanupIncomplete = false;
+    return this;
+  }
 
   /** Retain a completed observation when a later step fails. */
   retainPartialObservation(observation: AnalysisPartialObservation): this {
@@ -102,13 +135,23 @@ import type { WebScriptExportPartialObservation } from "./webScriptExport.js";
 import type { JavaScriptRecoveryPartialObservation } from "./javascript/javascriptRecovery.js";
 import type { BrowserScenarioPartialObservation } from "./browserScenarioCapture.js";
 import type { Evidence } from "./evidence.js";
+import type { ElectronPagePartialObservation } from "./javascript/electronObservation.js";
 import type { AndroidPartialObservation } from "./android/androidPartialObservation.js";
 import type { FirmwarePartialObservation } from "./firmware/firmwareAnalysis.js";
 import type {
+  AdbActivityStartPartialObservation,
   AdbAcquiredFilePartialObservation,
   AdbPackagePullPartialObservation,
 } from "./adb/adbDeviceAnalysis.js";
 import type { NativeUiObservationResult } from "./native/nativeUiObservation.js";
+import type { BinaryLayout } from "./native/binaryLayout.js";
+import type {
+  RecordedCrash,
+  RecordedCrashPartialObservation,
+} from "./native/recordedCrash.js";
+import type { WebPageInspection } from "./browserObservationSchemas.js";
+import type { WebExecution } from "./webExecution.js";
+import type { WebEventListeners } from "./webEventListeners.js";
 
 /** Provider-neutral evidence collected before a typed analysis failure. */
 export type AnalysisPartialObservation =
@@ -117,14 +160,22 @@ export type AnalysisPartialObservation =
   | FileOffsetPartialObservation
   | ElectronActivePartialObservation
   | BrowserScenarioPartialObservation
+  | WebPageInspection
+  | WebExecution
+  | WebEventListeners
   | JavaScriptRuntimeObservation
   | ArtifactInventoryPartialObservation
   | ArtifactExtractionPartialObservation
   | WebScriptExportPartialObservation
   | JavaScriptRecoveryPartialObservation
   | Evidence
+  | BinaryLayout
+  | RecordedCrash
+  | RecordedCrashPartialObservation
   | AndroidPartialObservation
   | FirmwarePartialObservation
   | NativeUiObservationResult
+  | ElectronPagePartialObservation
+  | AdbActivityStartPartialObservation
   | AdbAcquiredFilePartialObservation
   | AdbPackagePullPartialObservation;

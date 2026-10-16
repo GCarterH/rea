@@ -15,6 +15,10 @@ import type { ProgressReporter } from "./ProgressReporter.js";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
 import type { ProcessLineageObservation } from "../process/ProcessOwnership.js";
 import type { ProviderOperationHealth } from "../domain/providerOperationHealth.js";
+import {
+  relationshipCoverageSchema,
+  type RelationshipCoverage,
+} from "../domain/relationshipCoverage.js";
 
 export interface ExecutionOptions {
   readonly signal?: AbortSignal;
@@ -44,8 +48,27 @@ export interface AnalysisExecution {
   readonly provider: ProviderIdentity;
   readonly analysisProfile?: AnalysisProfileCommitment;
   readonly limitations: readonly string[];
+  /** Provider-owned completeness assessment for caller/callee observations. */
+  readonly relationshipCoverage?: RelationshipCoverage;
+  /**
+   * Whether the provider capped an `xrefs` read: true when it reported a
+   * truncation, false when it explicitly reported none. Absent when it reports
+   * nothing, which is not a completeness claim. Never part of Evidence or tool
+   * output.
+   */
+  readonly referencesTruncated?: boolean;
   readonly locations: readonly EvidenceLocation[];
   readonly subject: EvidenceSubjectTarget | null;
+}
+
+interface CreateAnalysisExecutionOptions {
+  readonly rawResult?: unknown;
+  readonly analysisProfile?: AnalysisProfileCommitment;
+  readonly limitations?: readonly string[];
+  readonly relationshipCoverage?: RelationshipCoverage;
+  readonly referencesTruncated?: boolean;
+  readonly locations?: readonly EvidenceLocation[];
+  readonly subject?: EvidenceSubjectTarget;
 }
 
 /**
@@ -55,30 +78,46 @@ export interface AnalysisExecution {
  * `result`. Omitting it records `null` rather than a second complete copy of
  * the normalized result in every Evidence record and tool response.
  */
-export const createAnalysisExecution = (
+export function createAnalysisExecution<Subject extends EvidenceSubjectTarget>(
   result: unknown,
   provider: ProviderIdentity,
-  options: {
-    readonly rawResult?: unknown;
-    readonly analysisProfile?: AnalysisProfileCommitment;
-    readonly limitations?: readonly string[];
-    readonly locations?: readonly EvidenceLocation[];
-    readonly subject?: EvidenceSubjectTarget;
-  } = {},
-): AnalysisExecution => ({
-  result: jsonValueSchema.parse(result),
-  rawResult:
-    options.rawResult === undefined
-      ? null
-      : jsonValueSchema.parse(options.rawResult),
-  provider,
-  ...(options.analysisProfile === undefined
-    ? {}
-    : { analysisProfile: structuredClone(options.analysisProfile) }),
-  limitations: [...(options.limitations ?? [])],
-  locations: [...(options.locations ?? [])],
-  subject: options.subject ?? null,
-});
+  options: CreateAnalysisExecutionOptions & { readonly subject: Subject },
+): Omit<AnalysisExecution, "subject"> & { readonly subject: Subject };
+export function createAnalysisExecution(
+  result: unknown,
+  provider: ProviderIdentity,
+  options?: CreateAnalysisExecutionOptions,
+): AnalysisExecution;
+export function createAnalysisExecution(
+  result: unknown,
+  provider: ProviderIdentity,
+  options: CreateAnalysisExecutionOptions = {},
+): AnalysisExecution {
+  return {
+    result: jsonValueSchema.parse(result),
+    rawResult:
+      options.rawResult === undefined
+        ? null
+        : jsonValueSchema.parse(options.rawResult),
+    provider,
+    ...(options.analysisProfile === undefined
+      ? {}
+      : { analysisProfile: structuredClone(options.analysisProfile) }),
+    limitations: [...(options.limitations ?? [])],
+    ...(options.relationshipCoverage === undefined
+      ? {}
+      : {
+          relationshipCoverage: relationshipCoverageSchema.parse(
+            options.relationshipCoverage,
+          ),
+        }),
+    ...(options.referencesTruncated === undefined
+      ? {}
+      : { referencesTruncated: options.referencesTruncated }),
+    locations: [...(options.locations ?? [])],
+    subject: options.subject ?? null,
+  };
+}
 
 /** Provider-neutral application capability for one analysis operation. */
 export interface AnalysisOperationPort {
@@ -109,6 +148,12 @@ export interface ProviderRequestActivitySnapshot {
 
 /** Provider session bound to exactly one parsed artifact. */
 export interface AnalysisClient extends AnalysisOperationPort {
+  /** Execute only if this operation can run without loading or starting a provider. */
+  executeIfReady?(
+    operation: AnalysisOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options?: ExecutionOptions,
+  ): Promise<Result<AnalysisExecution, AnalysisError> | undefined>;
   /** Retained token-verified process snapshots for dynamic providers this client started. */
   runtimeLineageSnapshots?(): readonly ProviderRuntimeLineageSnapshot[];
   /** Current provider work that may outlive a timed-out or cancelled caller. */
@@ -128,6 +173,12 @@ export interface AnalysisClientContext {
   readonly runId: string;
 }
 
+/** One lifecycle owner for descriptor cleanup and abortable inspection work. */
+export interface FileCloseResourceOwner {
+  retain(owner: { close(): Promise<void> }, resource: string): void;
+  run<T>(operation: () => Promise<T>): Promise<T>;
+}
+
 export interface ProviderIdentity {
   readonly id: string;
   readonly name: string;
@@ -142,6 +193,7 @@ export interface AnalysisProfileResolution {
 /** Cancellation context for side-effect-free provider profile resolution. */
 export interface AnalysisProfileResolutionOptions {
   readonly signal?: AbortSignal;
+  readonly fileCloseResources?: FileCloseResourceOwner;
 }
 
 interface CapabilityEffects {
@@ -230,6 +282,12 @@ export type ProviderTargetSupport =
       readonly diagnostics: Readonly<Record<string, JsonValue>>;
     };
 
+/** One owner-observed availability/capability snapshot for provider discovery. */
+export interface AnalysisProviderReadinessSnapshot {
+  readonly availability: ProviderAvailability;
+  readonly capabilities: readonly CapabilityDescriptor[];
+}
+
 /** Deep provider candidate discoverable before one target-bound route is chosen. */
 export interface AnalysisProviderCandidate extends AnalysisProvider {
   resolveAnalysisProfile(
@@ -237,5 +295,10 @@ export interface AnalysisProviderCandidate extends AnalysisProvider {
     options?: AnalysisProfileResolutionOptions,
   ): Promise<Result<AnalysisProfileResolution, AnalysisError>>;
   inspectAvailability(): ProviderAvailability;
+  inspectReadinessSnapshot?(): AnalysisProviderReadinessSnapshot;
   inspectTargetSupport(target: BinaryTarget): ProviderTargetSupport;
+  /** Observe retained candidate cleanup without starting or retrying work. */
+  hasPendingOwnedResources?(): boolean;
+  /** Release candidate resources that are independent of any active client. */
+  closeOwnedResources?(): Promise<Result<null, AnalysisError>>;
 }

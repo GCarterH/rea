@@ -21,6 +21,7 @@ import {
   type BrowserStepArtifacts,
 } from "../domain/browserScenarioCaptureValues.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { err, ok, type Result } from "../domain/result.js";
@@ -36,6 +37,9 @@ import {
 
 const OPERATION = "capture_browser_scenario" as const;
 import { PLAYWRIGHT_BROWSER_SCENARIO_PROVIDER_IDENTITY } from "./providerIdentities.js";
+
+const signalIsAborted = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true;
 
 type SnapshotKind = BrowserScenario["capture"]["after_each_step"][number];
 const SNAPSHOT_KINDS = [
@@ -172,7 +176,7 @@ const executeStep = async (input: {
       ),
     });
 
-  const actionStartedAt = Date.now();
+  const actionStartedAt = performance.now();
   session.setStep(stepIndex);
   const requestCancelled = (): boolean => signal?.aborted === true;
   let outcome: BrowserScenarioStepOutcome = {
@@ -200,7 +204,7 @@ const executeStep = async (input: {
     stepId: action.step_id,
     action: action.action,
     ...outcome,
-    elapsedMs: Date.now() - actionStartedAt,
+    elapsedMs: Math.max(0, Math.round(performance.now() - actionStartedAt)),
     beforeUrl,
     afterUrl: session.sanitizeUrl(session.currentUrl()),
     eventStart,
@@ -231,9 +235,9 @@ const runScenario = async (
   options: ExecutionOptions,
   retainCleanup: (close: () => Promise<unknown>) => void,
 ): Promise<BrowserScenarioCapture> => {
-  if (options.signal?.aborted === true)
+  if (options.signal?.aborted)
     throw new BrowserObservationError(OPERATION, "cancelled");
-  const startedAt = Date.now();
+  const startedAt = performance.now();
   const session = await openSession(scenario, {
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     retainCleanup,
@@ -250,7 +254,7 @@ const runScenario = async (
       await initialStep({
         session,
         scenario,
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
         signal: options.signal,
       }),
     );
@@ -325,7 +329,7 @@ const runScenario = async (
       }),
     });
   const completeness = globalCompleteness(scenario, session, steps);
-  return browserScenarioCaptureSchema.parse({
+  const capture = browserScenarioCaptureSchema.parse({
     ...browserScenarioCaptureData({
       session,
       scenario,
@@ -335,6 +339,21 @@ const runScenario = async (
     }),
     completeness,
   });
+  if (signalIsAborted(options.signal))
+    throw new AnalysisCancelledError(OPERATION, {
+      cause: options.signal?.reason,
+      partialObservation: {
+        kind: "browser-scenario-observation",
+        capture: {
+          ...capture,
+          limitations: [
+            ...capture.limitations,
+            "Scenario capture was cancelled; collected steps, observations, and cleanup state are retained.",
+          ],
+        },
+      },
+    });
+  return capture;
 };
 
 /** Controlled Playwright/CDP scenario driver with exact process ownership. */
